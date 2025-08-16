@@ -7,3 +7,4 @@ wallet_statistics.json
 pending_trades.json
 bot_config.json
 *.json
+.git
