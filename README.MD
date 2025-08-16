@@ -33,19 +33,23 @@ A sophisticated automated trading bot for Solana tokens using technical analysis
 
 ## 🏗️ Architecture
 
-The bot consists of three main components:
+The bot consists of four main components:
 
-1. **Dashboard (Python)** - `app.py`
+1. **Jupiter Tracker (Python)** - `jupiter_tracker.py`
+   - Collects real-time price data from multiple sources
+   - Processes and validates market data feeds
+
+2. **Dashboard (Python)** - `app_anon.py`
    - Processes price data and calculates technical indicators
    - Generates trading signals based on Fibonacci levels
-   - Creates comprehensive price savant data
+   - Provides live web dashboard at http://localhost:8051
 
-2. **Signal Bot (Python)** - `jupiter_signal_bot.py`
+3. **Signal Bot (Python)** - `trade_bot_anon.py`
    - Monitors signals from the dashboard
    - Sends Discord notifications
    - Triggers trade commands for execution
 
-3. **Jupiter Executor (Node.js)** - `jupiter-executor.js`
+4. **Jupiter Executor (Node.js)** - `jupiter-executor.js`
    - Executes actual trades on Jupiter DEX
    - Manages wallet statistics and position tracking
    - Provides real-time portfolio analytics
@@ -57,6 +61,7 @@ The bot consists of three main components:
 - Python 3.8+
 - Solana wallet keypair
 - Discord bot token
+- tmux (optional but recommended)
 
 ### Installation
 
