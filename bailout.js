@@ -32,7 +32,7 @@ class BailoutSeller {
         console.log(`🔑 Loaded wallet: ${this.wallet.publicKey.toString()}`);
     }
     
-    async getTokenBalance(tokenMintAddress) {
+    async getTokenAccountInfo(tokenMintAddress) {
         try {
             const tokenAccounts = await this.connection.getParsedTokenAccountsByOwner(
                 this.wallet.publicKey,
@@ -40,20 +40,37 @@ class BailoutSeller {
             );
             
             if (tokenAccounts.value.length === 0) {
-                return 0;
+                return { balance: 0, decimals: 6, rawAmount: 0 };
             }
             
             let totalBalance = 0;
+            let totalRawAmount = 0;
+            let decimals = 6; // Default fallback
+            
             for (const account of tokenAccounts.value) {
-                const balance = account.account.data.parsed.info.tokenAmount.uiAmount;
-                totalBalance += balance || 0;
+                const accountInfo = account.account.data.parsed.info;
+                const balance = accountInfo.tokenAmount.uiAmount || 0;
+                const rawAmount = parseInt(accountInfo.tokenAmount.amount);
+                decimals = accountInfo.tokenAmount.decimals;
+                
+                totalBalance += balance;
+                totalRawAmount += rawAmount;
             }
             
-            return totalBalance;
+            return { 
+                balance: totalBalance, 
+                decimals: decimals, 
+                rawAmount: totalRawAmount 
+            };
         } catch (error) {
-            console.error(`❌ Error getting token balance: ${error.message}`);
-            return 0;
+            console.error(`❌ Error getting token account info: ${error.message}`);
+            return { balance: 0, decimals: 6, rawAmount: 0 };
         }
+    }
+    
+    async getTokenBalance(tokenMintAddress) {
+        const info = await this.getTokenAccountInfo(tokenMintAddress);
+        return info.balance;
     }
     
     async getSolBalance() {
@@ -67,36 +84,62 @@ class BailoutSeller {
     }
     
     async getJupiterQuote(inputMint, outputMint, amount, slippageBps = 300) {
-        const url = `${this.config.jupiter.api_url}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amount}&slippageBps=${slippageBps}`;
+        // Make sure amount is a string and represents the raw token amount
+        const amountStr = amount.toString();
+        const url = `${this.config.jupiter.api_url}/quote?inputMint=${inputMint}&outputMint=${outputMint}&amount=${amountStr}&slippageBps=${slippageBps}`;
         
-        const response = await fetch(url);
-        if (!response.ok) {
-            throw new Error(`Jupiter quote failed: ${response.statusText}`);
+        console.log(`🔍 Jupiter Quote URL: ${url}`);
+        
+        try {
+            const response = await fetch(url);
+            const responseText = await response.text();
+            
+            if (!response.ok) {
+                console.error(`❌ Jupiter API Response: ${response.status} ${response.statusText}`);
+                console.error(`❌ Response body: ${responseText}`);
+                throw new Error(`Jupiter quote failed: ${response.status} ${response.statusText} - ${responseText}`);
+            }
+            
+            return JSON.parse(responseText);
+        } catch (error) {
+            console.error(`❌ Jupiter quote error: ${error.message}`);
+            throw error;
         }
-        
-        return await response.json();
     }
     
     async getJupiterSwapTransaction(quoteResponse) {
-        const swapResponse = await fetch(`${this.config.jupiter.api_url}/swap`, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json',
-            },
-            body: JSON.stringify({
-                quoteResponse,
-                userPublicKey: this.wallet.publicKey.toString(),
-                wrapAndUnwrapSol: true,
-                dynamicComputeUnitLimit: true,
-                prioritizationFeeLamports: Math.max(this.config.trading.priority_fee_lamports || 10000, 50000), // Higher priority for bailout
-            }),
-        });
+        const swapBody = {
+            quoteResponse,
+            userPublicKey: this.wallet.publicKey.toString(),
+            wrapAndUnwrapSol: true,
+            dynamicComputeUnitLimit: true,
+            prioritizationFeeLamports: Math.max(this.config.trading.priority_fee_lamports || 10000, 50000),
+        };
         
-        if (!swapResponse.ok) {
-            throw new Error(`Jupiter swap failed: ${swapResponse.statusText}`);
+        console.log(`🔍 Swap request body: ${JSON.stringify(swapBody, null, 2)}`);
+        
+        try {
+            const swapResponse = await fetch(`${this.config.jupiter.api_url}/swap`, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json',
+                },
+                body: JSON.stringify(swapBody),
+            });
+            
+            const responseText = await swapResponse.text();
+            
+            if (!swapResponse.ok) {
+                console.error(`❌ Jupiter Swap Response: ${swapResponse.status} ${swapResponse.statusText}`);
+                console.error(`❌ Response body: ${responseText}`);
+                throw new Error(`Jupiter swap failed: ${swapResponse.status} ${swapResponse.statusText} - ${responseText}`);
+            }
+            
+            return JSON.parse(responseText);
+        } catch (error) {
+            console.error(`❌ Jupiter swap error: ${error.message}`);
+            throw error;
         }
-        
-        return await swapResponse.json();
     }
     
     async waitForConfirmation(signature) {
@@ -134,14 +177,18 @@ class BailoutSeller {
         throw new Error(`Transaction confirmation timeout after ${timeout/1000} seconds`);
     }
     
-    async getCurrentTokenPrice(tokenAddress, tokenBalance) {
+    async getCurrentTokenPrice(tokenAddress, tokenInfo) {
         try {
             const SOL_MINT = 'So11111111111111111111111111111111111111112';
             
-            // Get quote for current token balance
-            const quote = await this.getJupiterQuote(tokenAddress, SOL_MINT, Math.floor(tokenBalance), 300);
+            if (tokenInfo.rawAmount === 0) {
+                return null;
+            }
+            
+            // Use raw amount for Jupiter quote
+            const quote = await this.getJupiterQuote(tokenAddress, SOL_MINT, tokenInfo.rawAmount, 300);
             const solReceived = parseInt(quote.outAmount) / 1e9;
-            const pricePerToken = solReceived / tokenBalance;
+            const pricePerToken = tokenInfo.balance > 0 ? solReceived / tokenInfo.balance : 0;
             
             return { pricePerToken, solReceived, quote };
         } catch (error) {
@@ -160,12 +207,14 @@ class BailoutSeller {
         let totalPositionValue = solBalance;
         
         for (const [tokenSymbol, tokenAddress] of tokens) {
-            const tokenBalance = await this.getTokenBalance(tokenAddress);
+            const tokenInfo = await this.getTokenAccountInfo(tokenAddress);
             
-            if (tokenBalance > 0) {
-                console.log(`\n🪙 ${tokenSymbol} Balance: ${tokenBalance.toLocaleString()}`);
+            if (tokenInfo.balance > 0) {
+                console.log(`\n🪙 ${tokenSymbol} Balance: ${tokenInfo.balance.toLocaleString()}`);
+                console.log(`🔢 Raw Amount: ${tokenInfo.rawAmount.toLocaleString()}`);
+                console.log(`🎯 Decimals: ${tokenInfo.decimals}`);
                 
-                const priceData = await this.getCurrentTokenPrice(tokenAddress, tokenBalance);
+                const priceData = await this.getCurrentTokenPrice(tokenAddress, tokenInfo);
                 if (priceData) {
                     console.log(`💎 Current Value: ${priceData.solReceived.toFixed(6)} SOL`);
                     console.log(`📈 Price per token: ${priceData.pricePerToken.toFixed(10)} SOL`);
@@ -184,18 +233,24 @@ class BailoutSeller {
         return { solBalance, tokens, totalPositionValue };
     }
     
-    async executeSellTransaction(tokenAddress, tokenSymbol, tokenBalance, slippageBps = 300) {
+    async executeSellTransaction(tokenAddress, tokenSymbol, tokenInfo, slippageBps = 300) {
         try {
-            console.log(`\n🔄 Executing sell: ${tokenBalance.toLocaleString()} ${tokenSymbol}`);
+            console.log(`\n🔄 Executing sell: ${tokenInfo.balance.toLocaleString()} ${tokenSymbol}`);
+            console.log(`🔢 Raw amount: ${tokenInfo.rawAmount.toLocaleString()}`);
+            console.log(`🎯 Decimals: ${tokenInfo.decimals}`);
             
             const SOL_MINT = 'So11111111111111111111111111111111111111112';
             
-            // Get fresh quote
+            if (tokenInfo.rawAmount === 0) {
+                throw new Error('No tokens to sell (raw amount is 0)');
+            }
+            
+            // Get fresh quote using raw amount
             console.log('📊 Getting Jupiter quote...');
-            const quote = await this.getJupiterQuote(tokenAddress, SOL_MINT, Math.floor(tokenBalance), slippageBps);
+            const quote = await this.getJupiterQuote(tokenAddress, SOL_MINT, tokenInfo.rawAmount, slippageBps);
             
             const expectedSol = parseInt(quote.outAmount) / 1e9;
-            console.log(`📈 Quote: ${tokenBalance.toLocaleString()} ${tokenSymbol} → ~${expectedSol.toFixed(6)} SOL`);
+            console.log(`📈 Quote: ${tokenInfo.balance.toLocaleString()} ${tokenSymbol} → ~${expectedSol.toFixed(6)} SOL`);
             
             // Create swap transaction
             console.log('🔄 Creating swap transaction...');
@@ -223,7 +278,8 @@ class BailoutSeller {
             return {
                 success: true,
                 signature,
-                tokensSold: tokenBalance,
+                tokensSold: tokenInfo.balance,
+                rawAmount: tokenInfo.rawAmount,
                 expectedSol,
                 timestamp: new Date().toISOString()
             };
@@ -233,7 +289,8 @@ class BailoutSeller {
             return {
                 success: false,
                 error: error.message,
-                tokensSold: tokenBalance,
+                tokensSold: tokenInfo.balance,
+                rawAmount: tokenInfo.rawAmount,
                 timestamp: new Date().toISOString()
             };
         }
@@ -274,9 +331,13 @@ class BailoutSeller {
             // Find tokens with balance
             const tokensWithBalance = [];
             for (const [tokenSymbol, tokenAddress] of positionData.tokens) {
-                const balance = await this.getTokenBalance(tokenAddress);
-                if (balance > 0) {
-                    tokensWithBalance.push({ symbol: tokenSymbol, address: tokenAddress, balance });
+                const tokenInfo = await this.getTokenAccountInfo(tokenAddress);
+                if (tokenInfo.balance > 0 && tokenInfo.rawAmount > 0) {
+                    tokensWithBalance.push({ 
+                        symbol: tokenSymbol, 
+                        address: tokenAddress, 
+                        info: tokenInfo
+                    });
                 }
             }
             
@@ -288,7 +349,7 @@ class BailoutSeller {
             
             console.log(`🎯 Found ${tokensWithBalance.length} token(s) to sell:`);
             tokensWithBalance.forEach((token, index) => {
-                console.log(`   ${index + 1}. ${token.symbol}: ${token.balance.toLocaleString()}`);
+                console.log(`   ${index + 1}. ${token.symbol}: ${token.info.balance.toLocaleString()} (${token.info.rawAmount.toLocaleString()} raw)`);
             });
             
             // Confirmation prompts
@@ -338,7 +399,7 @@ class BailoutSeller {
                 const result = await this.executeSellTransaction(
                     token.address, 
                     token.symbol, 
-                    token.balance,
+                    token.info,
                     slippageBps
                 );
                 
