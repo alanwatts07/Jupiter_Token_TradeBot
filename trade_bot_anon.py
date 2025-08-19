@@ -1,4 +1,4 @@
-# Jupiter Signal Bot - Reverted with P&L tracking from the most recent buy
+# Jupiter Signal Bot - MODIFIED to read from SQLite database
 import discord
 from discord.ext import commands, tasks
 import asyncio
@@ -8,9 +8,10 @@ import time
 import subprocess
 from datetime import datetime, timezone, timedelta
 from collections import deque
+import sqlite3 # ADDED
 
 # --- Bot Configuration ---
-PRICE_SAVANT_FILE = "price_savant_anon.json"
+PRICE_SAVANT_DB = "price_savant.db" # CHANGED: Using SQLite database now
 CONFIG_FILE = "config.json"
 WALLET_STATS_FILE = "wallet_statistics.json"
 CHECK_INTERVAL_SECONDS = 5
@@ -77,132 +78,68 @@ def load_wallet_stats():
             
     return stats
 
-def read_last_savant_record():
-    """Read the most recent price/signal data from the savant file"""
-    if not os.path.exists(PRICE_SAVANT_FILE): return None
+def db_query(query, params=(), fetch_one=False):
+    """Helper function to query the SQLite database."""
+    if not os.path.exists(PRICE_SAVANT_DB):
+        print(f"[!] Database file not found: {PRICE_SAVANT_DB}")
+        return None
     try:
-        with open(PRICE_SAVANT_FILE, 'rb') as f:
-            f.seek(0, os.SEEK_END)
-            file_size = f.tell()
-            if file_size == 0: return None
-            buffer_size = 4096
-            seek_pos = max(0, file_size - buffer_size)
-            f.seek(seek_pos)
-            buffer = f.read().decode('utf-8', errors='ignore')
-            last_obj_start = buffer.rfind('{')
-            if last_obj_start == -1: return None
-            temp_buffer = buffer[last_obj_start:]
-            brace_level = 0
-            last_obj_end = -1
-            for i, char in enumerate(temp_buffer):
-                if char == '{': brace_level += 1
-                elif char == '}':
-                    brace_level -= 1
-                    if brace_level == 0:
-                        last_obj_end = i + 1
-                        break
-            if last_obj_end != -1: return json.loads(temp_buffer[:last_obj_end])
-            return None
+        conn = sqlite3.connect(PRICE_SAVANT_DB)
+        conn.row_factory = sqlite3.Row
+        cursor = conn.cursor()
+        cursor.execute(query, params)
+        if fetch_one:
+            result = cursor.fetchone()
+        else:
+            result = cursor.fetchall()
+        conn.close()
+        return result
     except Exception as e:
-        print(f"[!] Error in read_last_savant_record: {e}")
+        print(f"❌ Database query error: {e}")
         return None
 
+def read_last_savant_record():
+    """MODIFIED: Reads the single most recent record from the database."""
+    row = db_query("SELECT * FROM price_data ORDER BY timestamp DESC LIMIT 1", fetch_one=True)
+    return dict(row) if row else None
+
 def read_recent_savant_records(num_records_to_get=100):
-    """
-    FIXED: Robustly reads the last N JSON objects from a file,
-    even if they are pretty-printed across multiple lines.
-    """
-    if not os.path.exists(PRICE_SAVANT_FILE):
-        return []
-    
-    print(f"[DEBUG] Reading last ~{num_records_to_get} records from {PRICE_SAVANT_FILE}...")
-    try:
-        with open(PRICE_SAVANT_FILE, 'r', encoding='utf-8') as f:
-            content = f.read()
-        
-        # This is a robust way to handle JSON that might not be one-object-per-line
-        decoder = json.JSONDecoder()
-        all_records = []
-        pos = 0
-        
-        # Strip leading/trailing whitespace and brackets that might wrap the whole file
-        content = content.strip()
-        if content.startswith('[') and content.endswith(']'):
-            content = content[1:-1]
-
-        while pos < len(content):
-            try:
-                # Find the start of the next JSON object
-                match = content.find('{', pos)
-                if match == -1:
-                    break
-                
-                # Decode one object
-                obj, end_pos = decoder.raw_decode(content[match:])
-                all_records.append(obj)
-                pos = match + end_pos
-            except json.JSONDecodeError:
-                # Move past the error point
-                pos += 1
-        
-        print(f"[DEBUG] Successfully parsed a total of {len(all_records)} records from the file.")
-        
-        # Return only the last N records
-        return all_records[-num_records_to_get:]
-
-    except Exception as e:
-        print(f"[!] Error reading recent savant records: {e}")
-        return []
+    """MODIFIED: Reads the last N records from the database."""
+    rows = db_query("SELECT * FROM price_data ORDER BY timestamp DESC LIMIT ?", (num_records_to_get,))
+    return [dict(row) for row in rows] if rows else []
 
 
 def get_price_trend_from_savant():
     """
-    OPTIMIZED & MORE ROBUST: Calculates price trend using the last ~100 records.
+    OPTIMIZED & MORE ROBUST: Calculates price trend using the last ~100 records from the DB.
     """
-    print("[DEBUG] Calculating price trend...")
     recent_records = read_recent_savant_records(num_records_to_get=100)
     if len(recent_records) < 2:
         return None
 
-    # Convert timestamps to datetime objects for accurate sorting
     for record in recent_records:
         try:
-            timestamp_str = record['timestamp'] # Raises KeyError if missing
-            record['datetime'] = datetime.fromisoformat(timestamp_str.replace('Z', '+00:00'))
-        except KeyError:
-            # DEBUG: Show records missing the timestamp key
-            print(f"[DEBUG] Record missing 'timestamp' key: {record}")
-            record['datetime'] = None
-        except (ValueError, TypeError) as e:
-            # DEBUG: Show which timestamps have the wrong format
-            print(f"[DEBUG] Failed to parse timestamp string: '{record.get('timestamp')}'. Error: {e}")
+            record['datetime'] = datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00'))
+        except (ValueError, TypeError, KeyError):
             record['datetime'] = None
     
     valid_records = [r for r in recent_records if r['datetime'] is not None]
-    print(f"[DEBUG] Found {len(valid_records)} records with valid timestamps.")
     if len(valid_records) < 2:
-        print("[DEBUG] Not enough valid records to calculate trend.")
         return None
 
     valid_records.sort(key=lambda x: x['datetime'])
     
     oldest_record = valid_records[0]
     newest_record = valid_records[-1]
-
     old_price = oldest_record.get('price')
     new_price = newest_record.get('price')
-    
     time_delta_minutes = round((newest_record['datetime'] - oldest_record['datetime']).total_seconds() / 60)
 
     if old_price is None or new_price is None or old_price == 0 or time_delta_minutes <= 0:
         return None
 
     percentage_change = ((new_price - old_price) / old_price) * 100
-
-    return {
-        "change_pct": percentage_change,
-        "timeframe": f"last {time_delta_minutes} minutes"
-    }
+    return {"change_pct": percentage_change, "timeframe": f"last {time_delta_minutes} minutes"}
 
 def trigger_buy_trade(price, savant_data):
     """Write a buy command for the Jupiter executor to process"""
@@ -429,6 +366,49 @@ async def wallet_command(ctx):
         return
     await send_discord_embed(thinking_msg, "💼 **Wallet Statistics (Tracking from last buy)**", 0x3498db, wallet_stats=wallet_stats)
 
+@bot.command(name='history') # NEW COMMAND
+async def history_command(ctx):
+    """Fetches and displays the last 10 records from the price savant database."""
+    thinking_msg = await ctx.send("⏳ *Fetching last 10 records from the database...*")
+    
+    # Fetch the last 10 records, which will be in descending order
+    recent_records = read_recent_savant_records(num_records_to_get=10)
+    
+    if not recent_records:
+        await thinking_msg.edit(content="❌ No records found in the database.")
+        return
+    
+    # Reverse the list so the newest record is at the bottom
+    recent_records.reverse()
+    
+    # Format the message
+    message_parts = ["**Last 10 Records from `price_savant.db`:**\n"]
+    for record in recent_records:
+        # Format the timestamp for readability
+        try:
+            ts = datetime.fromisoformat(record['timestamp'].replace('Z', '+00:00')).strftime('%H:%M:%S')
+        except:
+            ts = "Invalid Time"
+            
+        price = record.get('price', 0)
+        buy_signal = record.get('buy_signal', False)
+        trigger_armed = record.get('trigger_armed', False)
+        
+        # Add an indicator for buy signals
+        signal_emoji = "🚀" if buy_signal else " "
+        
+        message_parts.append(f"`{ts}` {signal_emoji} Price: `{price:.10f}`, Armed: `{trigger_armed}`")
+
+    # Join the parts and send
+    full_message = "\n".join(message_parts)
+    
+    # Discord has a 2000 character limit per message
+    if len(full_message) > 2000:
+        full_message = full_message[:1990] + "\n... (truncated)"
+        
+    await thinking_msg.edit(content=full_message)
+
+
 @bot.command(name='sell')
 @is_owner()
 async def sell_command(ctx):
@@ -465,6 +445,7 @@ async def help_command(ctx):
     embed.add_field(name="!status", value="Get current bot status and portfolio overview.", inline=False)
     embed.add_field(name="!price", value="Show current price data and indicators.", inline=False)
     embed.add_field(name="!wallet", value="Display wallet statistics and performance.", inline=False)
+    embed.add_field(name="!history", value="Show the last 10 records from the price database.", inline=False) # ADDED
     if ctx.author.id == OWNER_ID:
         embed.add_field(name="!sell", value="🔴 **OWNER ONLY** - Emergency sell all tokens.", inline=False)
     await ctx.send(embed=embed)
